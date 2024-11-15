@@ -7,8 +7,6 @@ Usage:
     python main.py --file path/to/video.mp4 --ai openai
     python main.py --record 60 --ai claude
 """
-#TODO: get attendees list
-#TODO: build logic to record when speach is uninterpretable  with a correlating timestamp to the transcript
 
 import logging
 import os
@@ -27,6 +25,28 @@ import tempfile
 import base64
 from pydub import AudioSegment
 import math
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from tqdm.asyncio import tqdm_asyncio
+
+
+async def identify_attendees(transcript: str) -> List[str]:
+    """TODO: Identify and extract list of attendees from transcript"""
+    pass
+
+
+async def detect_unclear_speech(audio_segment: AudioSegment) -> List[Dict[str, any]]:
+    """TODO: Detect timestamps where speech is unclear or uninterpretable
+
+    Returns:
+        List of dicts containing:
+        - timestamp: float (in seconds)
+        - duration: float (length of unclear segment)
+        - confidence: float (certainty of detection)
+    """
+    pass
 
 # Configure logging
 logging.basicConfig(
@@ -163,26 +183,27 @@ class AudioRecorder:
             logger.error(f"Error saving audio file: {e}")
             raise
 
-class TranscriptionService:
-    """Handles audio transcription using OpenAI's Whisper model"""
 
-    def __init__(self, openai_client, anthropic_client=None):
-        """Initialize the transcription service with OpenAI client and optional Anthropic client"""
+class TranscriptionService:
+    """Handles audio transcription using OpenAI's Whisper model with async chunk processing"""
+
+    def __init__(self, openai_client, anthropic_client=None, max_concurrent=3):
+        """
+        Initialize the transcription service
+
+        Args:
+            openai_client: OpenAI client instance
+            anthropic_client: Optional Anthropic client instance
+            max_concurrent: Maximum number of concurrent API calls
+        """
         self.openai_client = openai_client
         self.anthropic_client = anthropic_client
         self.converter = AudioConverter()
         self.max_file_size = 25 * 1024 * 1024  # 25MB in bytes
+        self.max_concurrent = max_concurrent
 
-    def transcribe(self, audio_file: Path) -> Optional[str]:
-        """
-        Transcribe audio file using Whisper with chunking and Claude fallback
-
-        Args:
-            audio_file: Path to the audio/video file
-
-        Returns:
-            Optional[str]: Transcribed text or None if transcription fails
-        """
+    async def transcribe(self, audio_file: Path) -> Optional[str]:
+        """Async transcription with chunk processing"""
         logger.info(f"Processing {audio_file}")
         try:
             # Convert to WAV if needed
@@ -197,19 +218,19 @@ class TranscriptionService:
                 try:
                     if file_size > self.max_file_size:
                         logger.info("File too large, splitting into chunks")
-                        transcript = self._transcribe_large_file(wav_file)
+                        transcript = await self._transcribe_large_file(wav_file)
                     else:
-                        transcript = self._transcribe_single_file(wav_file)
+                        transcript = await self._transcribe_single_file(wav_file)
 
                     if transcript:
                         return transcript
                 except Exception as e:
                     logger.warning(f"Whisper transcription failed: {e}")
 
-                    # Try Claude fallback if available and file is not too large
+                    # Try Claude fallback if available
                     if self.anthropic_client and file_size <= self.max_file_size:
                         logger.info("Attempting transcription with Claude")
-                        return self._transcribe_with_claude(wav_file)
+                        return await self._transcribe_with_claude(wav_file)
 
                 return None
 
@@ -222,28 +243,34 @@ class TranscriptionService:
             logger.error(f"Transcription error: {e}")
             return None
 
-    def _transcribe_single_file(self, wav_file: Path) -> Optional[str]:
-        """Transcribe a single file that's under the size limit"""
+    async def _transcribe_single_file(self, wav_file: Path) -> Optional[str]:
+        """Transcribe a single file asynchronously"""
         with open(wav_file, "rb") as audio:
-            transcript = self.openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio,
-                language="en"
-            )
-            return transcript.text if transcript else None
+            # Use ThreadPoolExecutor for CPU-bound operations
+            with ThreadPoolExecutor() as pool:
+                loop = asyncio.get_event_loop()
+                transcript = await loop.run_in_executor(
+                    pool,
+                    lambda: self.openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio,
+                        language="en"
+                    )
+                )
+                return transcript.text if transcript else None
 
-    def _transcribe_large_file(self, wav_file: Path) -> Optional[str]:
-        """Handle transcription of files larger than 25MB by splitting them"""
+    async def _transcribe_large_file(self, wav_file: Path) -> Optional[str]:
+        """Handle transcription of large files with async chunk processing"""
         try:
             # Load audio file
             audio = AudioSegment.from_wav(str(wav_file))
 
-            # Calculate duration in milliseconds for ~20MB chunks (leaving buffer)
+            # Calculate chunk parameters
             total_size = os.path.getsize(wav_file)
-            chunk_size_ratio = self.max_file_size / total_size * 0.8  # 80% of max size to be safe
+            chunk_size_ratio = self.max_file_size / total_size * 0.8
             chunk_duration = len(audio) * chunk_size_ratio
 
-            # Split into chunks
+            # Create chunks
             chunks = []
             for start in range(0, len(audio), int(chunk_duration)):
                 end = min(start + int(chunk_duration), len(audio))
@@ -252,65 +279,86 @@ class TranscriptionService:
 
             logger.info(f"Split audio into {len(chunks)} chunks")
 
-            # Process each chunk
-            transcripts = []
+            # Create temporary files for chunks
+            chunk_files = []
             for i, chunk in enumerate(chunks, 1):
-                logger.info(f"Processing chunk {i}/{len(chunks)}")
-
-                # Save chunk to temporary file
                 temp_chunk = Path(tempfile.gettempdir()) / f"chunk_{i}.wav"
                 chunk.export(str(temp_chunk), format='wav')
+                chunk_files.append(temp_chunk)
 
-                try:
-                    # Transcribe chunk
-                    chunk_transcript = self._transcribe_single_file(temp_chunk)
-                    if chunk_transcript:
-                        transcripts.append(chunk_transcript)
-                    else:
-                        logger.warning(f"Failed to transcribe chunk {i}")
-                finally:
-                    # Clean up temp chunk file
-                    temp_chunk.unlink()
+            try:
+                # Process chunks concurrently with rate limiting
+                semaphore = asyncio.Semaphore(self.max_concurrent)
+                async with aiohttp.ClientSession() as session:
+                    tasks = []
+                    for chunk_file in chunk_files:
+                        task = asyncio.create_task(
+                            self._process_chunk(chunk_file, semaphore)
+                        )
+                        tasks.append(task)
 
-            # Combine all transcriptions
-            if transcripts:
-                return " ".join(transcripts)
-            return None
+                    # Wait for all chunks to be processed
+                    transcripts = await tqdm_asyncio.gather(*tasks, desc="Processing chunks")
+
+                # Filter out None values and join transcripts
+                valid_transcripts = [t for t in transcripts if t]
+                if valid_transcripts:
+                    return " ".join(valid_transcripts)
+                return None
+
+            finally:
+                # Clean up chunk files
+                for chunk_file in chunk_files:
+                    chunk_file.unlink(missing_ok=True)
 
         except Exception as e:
             logger.error(f"Error processing large file: {e}")
             return None
 
-    def _transcribe_with_claude(self, audio_file: Path) -> Optional[str]:
-        """Attempt transcription with Claude"""
+    async def _process_chunk(self, chunk_file: Path, semaphore: asyncio.Semaphore) -> Optional[str]:
+        """Process a single chunk with rate limiting"""
+        async with semaphore:
+            try:
+                return await self._transcribe_single_file(chunk_file)
+            except Exception as e:
+                logger.error(f"Error processing chunk {chunk_file}: {e}")
+                return None
+
+    async def _transcribe_with_claude(self, audio_file: Path) -> Optional[str]:
+        """Attempt transcription with Claude asynchronously"""
         try:
             with open(audio_file, "rb") as audio:
-                # Create message with audio file
-                message = self.anthropic_client.messages.create(
-                    model="claude-3-sonnet-20240229",
-                    max_tokens=1500,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Please transcribe this audio file accurately, maintaining all speaker changes and important details:"
-                            },
-                            {
-                                "type": "image",  # Claude handles audio through the image API
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "audio/wav",
-                                    "data": base64.b64encode(audio.read()).decode()
-                                }
-                            }
-                        ]
-                    }]
-                )
+                # Use ThreadPoolExecutor for CPU-bound operations
+                with ThreadPoolExecutor() as pool:
+                    loop = asyncio.get_event_loop()
+                    message = await loop.run_in_executor(
+                        pool,
+                        lambda: self.anthropic_client.messages.create(
+                            model="claude-3-sonnet-20240229",
+                            max_tokens=1500,
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Please transcribe this audio file accurately, maintaining all speaker changes and important details:"
+                                    },
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "audio/wav",
+                                            "data": base64.b64encode(audio.read()).decode()
+                                        }
+                                    }
+                                ]
+                            }]
+                        )
+                    )
 
-                if message.content:
-                    logger.info("Claude transcription successful")
-                    return message.content
+                    if message.content:
+                        logger.info("Claude transcription successful")
+                        return message.content
             return None
         except Exception as e:
             logger.error(f"Claude transcription failed: {e}")
@@ -432,8 +480,9 @@ def save_analysis(analysis: str, output_path: str) -> None:
         logger.error(f"Error saving analysis: {e}")
         raise
 
-def main():
-    """Main execution function"""
+
+async def async_main():
+    """Async main execution function"""
     args = parse_args()
 
     try:
@@ -462,10 +511,10 @@ def main():
             logger.info(f"Recorded new audio file: {audio_path}")
 
         # Process audio
-        if transcript := transcriber.transcribe(audio_path):
+        if transcript := await transcriber.transcribe(audio_path):
             logger.info("Transcription successful")
             print("\nTranscript:")
-            print(transcript)  # Print transcript for review
+            print(transcript)
 
             if analysis := analyzer.analyze(transcript, args.ai):
                 logger.info("Analysis successful")
@@ -479,6 +528,12 @@ def main():
     except Exception as e:
         logger.error(f"Application error: {e}")
         raise
+
+
+def main():
+    """Entry point wrapper for async main"""
+    asyncio.run(async_main())
+
 
 if __name__ == "__main__":
     main()

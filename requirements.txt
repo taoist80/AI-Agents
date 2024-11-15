@@ -1,0 +1,28 @@
+# Core AI Services
+openai
+anthropic
+
+# Audio Processing
+moviepy
+wave
+pydub
+ffmpeg-python
+
+# Optional: Audio Recording
+PyAudio
+
+# HTTP Requests
+requests
+aiohttp  # For async HTTP requests
+
+# Environment Variables
+python-dotenv
+
+# Progress Bars
+tqdm
+
+# File Operations and Data Handling
+pathlib
+
+# Async Support
+asyncio
