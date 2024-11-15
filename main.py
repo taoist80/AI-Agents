@@ -1,28 +1,20 @@
 """
 Meeting Recording and Analysis Tool
 ---------------------------------
-CLI tool for analyzing meeting audio files or recording new audio.
+CLI tool for analyzing meeting recordings (WAV, MP4, etc.) using OpenAI and Anthropic (Claude).
 
 Usage:
-    python meeting_recorder.py --file path/to/audio.wav  # Analyze existing file
+    python meeting_recorder.py --file path/to/video.mp4  # Analyze existing file
     python meeting_recorder.py --record 60  # Record for 60 seconds
-    python meeting_recorder.py --help  # Show help
-
-Dependencies:
-    - pyaudio
-    - wave
-    - speech_recognition
-    - google.cloud.speech
-    - anthropic
-    - openai
-    - requests
+    python meeting_recorder.py --file path/to/audio.wav --ai claude  # Force Claude
+    python meeting_recorder.py --file path/to/audio.wav --ai openai  # Force OpenAI
 """
 
 import logging
 import os
 import argparse
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 from pathlib import Path
 import pyaudio
 import wave
@@ -31,6 +23,8 @@ from anthropic import Anthropic
 import openai
 import requests
 from datetime import datetime
+from moviepy.editor import VideoFileClip, AudioFileClip
+import tempfile
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +36,64 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class AudioConverter:
+    """Handles conversion of various audio/video formats to WAV"""
+    
+    @staticmethod
+    def convert_to_wav(input_path: Path) -> Path:
+        """
+        Convert audio/video file to WAV format suitable for transcription
+        
+        Args:
+            input_path: Path to input file
+            
+        Returns:
+            Path: Path to converted WAV file
+        """
+        input_format = input_path.suffix.lower()
+        
+        # If already WAV, return original path
+        if input_format == '.wav':
+            return input_path
+            
+        try:
+            # Create temporary WAV file
+            temp_wav = Path(tempfile.gettempdir()) / f"temp_{input_path.stem}.wav"
+            
+            logger.info(f"Converting {input_format} to WAV...")
+            
+            if input_format in ['.mp4', '.avi', '.mov', '.mkv']:
+                # Handle video files
+                video = VideoFileClip(str(input_path))
+                audio = video.audio
+                audio.write_audiofile(
+                    str(temp_wav),
+                    fps=16000,  # Match our desired sample rate
+                    nbytes=2,   # 16-bit audio
+                    codec='pcm_s16le'  # Standard WAV codec
+                )
+                video.close()
+                audio.close()
+            elif input_format in ['.mp3', '.m4a', '.aac', '.ogg']:
+                # Handle audio files
+                audio = AudioFileClip(str(input_path))
+                audio.write_audiofile(
+                    str(temp_wav),
+                    fps=16000,
+                    nbytes=2,
+                    codec='pcm_s16le'
+                )
+                audio.close()
+            else:
+                raise ValueError(f"Unsupported file format: {input_format}")
+                
+            logger.info(f"Conversion successful: {temp_wav}")
+            return temp_wav
+            
+        except Exception as e:
+            logger.error(f"Error converting audio: {e}")
+            raise
 
 @dataclass
 class AudioConfig:
@@ -55,29 +107,20 @@ class AudioConfig:
 
 class AudioRecorder:
     """Handles audio recording functionality"""
-
+    
     def __init__(self, config: AudioConfig):
         self.config = config
         self._validate_config()
-
+    
     def _validate_config(self) -> None:
         """Validate audio configuration parameters"""
         if self.config.seconds <= 0:
             raise ValueError("Recording duration must be positive")
         if self.config.rate <= 0:
             raise ValueError("Sample rate must be positive")
-
+    
     def record(self) -> Path:
-        """
-        Record audio using PyAudio
-
-        Returns:
-            Path: Path to the recorded audio file
-
-        Raises:
-            OSError: If there's an error accessing the audio device
-            IOError: If there's an error saving the audio file
-        """
+        """Record audio using PyAudio"""
         logger.info("Starting audio recording...")
         try:
             audio = pyaudio.PyAudio()
@@ -88,20 +131,20 @@ class AudioRecorder:
                 input=True,
                 frames_per_buffer=self.config.chunk
             )
-
+            
             frames: List[bytes] = []
             for _ in range(0, int(self.config.rate / self.config.chunk * self.config.seconds)):
                 frames.append(stream.read(self.config.chunk))
-
+            
             stream.stop_stream()
             stream.close()
             audio.terminate()
-
+            
             output_path = Path(self.config.output_file)
             self._save_audio(output_path, audio, frames)
             logger.info(f"Audio recorded successfully: {output_path}")
             return output_path
-
+            
         except OSError as e:
             logger.error(f"Error recording audio: {e}")
             raise
@@ -120,61 +163,78 @@ class AudioRecorder:
 
 class TranscriptionService:
     """Handles audio transcription using Google Speech Recognition"""
-
+    
     def __init__(self):
         self.recognizer = sr.Recognizer()
-
+        self.converter = AudioConverter()
+    
     def transcribe(self, audio_file: Path) -> Optional[str]:
         """
         Transcribe audio file using Google Speech Recognition
-
+        
         Args:
-            audio_file: Path to the audio file
-
+            audio_file: Path to the audio/video file
+            
         Returns:
             Optional[str]: Transcribed text or None if transcription fails
         """
-        logger.info(f"Starting transcription of {audio_file}")
+        logger.info(f"Processing {audio_file}")
         try:
-            with sr.AudioFile(str(audio_file)) as source:
+            # Convert to WAV if needed
+            wav_file = self.converter.convert_to_wav(audio_file)
+            
+            # Transcribe
+            with sr.AudioFile(str(wav_file)) as source:
                 audio_data = self.recognizer.record(source)
-
+            
             text = self.recognizer.recognize_google(audio_data)
             logger.info("Transcription completed successfully")
+            
+            # Clean up temporary file if it was created
+            if wav_file != audio_file and wav_file.parent == Path(tempfile.gettempdir()):
+                wav_file.unlink()
+                
             return text
-
+            
         except sr.UnknownValueError:
             logger.error("Google Speech Recognition could not understand audio")
             return None
         except sr.RequestError as e:
             logger.error(f"Google Speech Recognition service error: {e}")
             return None
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            return None
 
 class IncidentAnalyzer:
     """Analyzes transcribed text using AI services (OpenAI/Claude)"""
-
+    
     def __init__(self, openai_api_key: str, anthropic_api_key: str):
         self.openai_client = openai.Client(api_key=openai_api_key)
         self.anthropic_client = Anthropic(api_key=anthropic_api_key)
-
-    def analyze(self, transcript: str, retry: bool = True) -> Optional[str]:
+    
+    def analyze(self, transcript: str, ai_service: Literal["auto", "openai", "claude"] = "auto") -> Optional[str]:
         """
-        Analyze transcript using AI services with fallback
-
+        Analyze transcript using specified AI service
+        
         Args:
             transcript: Text to analyze
-            retry: Whether to retry with Claude if OpenAI fails
-
+            ai_service: Which AI service to use ("auto", "openai", or "claude")
+            
         Returns:
-            Optional[str]: Analysis results or None if both services fail
+            Optional[str]: Analysis results or None if analysis fails
         """
-        try:
-            content = self._analyze_with_openai(transcript)
-            logger.info("OpenAI analysis completed successfully")
-            return content
-        except Exception as e:
-            logger.error(f"OpenAI analysis failed: {e}")
-            if retry:
+        if ai_service == "claude":
+            return self._analyze_with_claude(transcript)
+        elif ai_service == "openai":
+            return self._analyze_with_openai(transcript)
+        else:  # auto mode with fallback
+            try:
+                content = self._analyze_with_openai(transcript)
+                logger.info("OpenAI analysis completed successfully")
+                return content
+            except Exception as e:
+                logger.error(f"OpenAI analysis failed: {e}")
                 logger.info("Attempting analysis with Claude...")
                 try:
                     content = self._analyze_with_claude(transcript)
@@ -182,8 +242,8 @@ class IncidentAnalyzer:
                     return content
                 except Exception as e:
                     logger.error(f"Claude analysis failed: {e}")
-            return None
-
+                return None
+    
     def _analyze_with_openai(self, transcript: str) -> str:
         """Analyze transcript using OpenAI's GPT-4"""
         prompt = self._get_analysis_prompt(transcript)
@@ -193,7 +253,7 @@ class IncidentAnalyzer:
             max_tokens=1000
         )
         return response.choices[0].message.content
-
+    
     def _analyze_with_claude(self, transcript: str) -> str:
         """Analyze transcript using Anthropic's Claude"""
         prompt = self._get_analysis_prompt(transcript)
@@ -203,7 +263,7 @@ class IncidentAnalyzer:
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content
-
+    
     @staticmethod
     def _get_analysis_prompt(transcript: str) -> str:
         """Generate analysis prompt template"""
@@ -216,82 +276,40 @@ class IncidentAnalyzer:
 Transcript:
 {transcript}"""
 
-class XMattersNotifier:
-    """Handles sending analysis results to xMatters"""
-
-    def __init__(self, url: str, api_key: str):
-        self.url = url
-        self.api_key = api_key
-
-    def send_notification(self, content: str) -> bool:
-        """
-        Send analysis results to xMatters
-
-        Args:
-            content: Analysis content to send
-
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
-            }
-
-            payload = {
-                "properties": {
-                    "title": f"Incident Analysis - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                    "analysis": content
-                },
-                "recipients": [{"targetName": "Incident Response Team"}]
-            }
-
-            response = requests.post(self.url, headers=headers, json=payload)
-
-            if response.status_code == 202:
-                logger.info("Analysis sent to xMatters successfully")
-                return True
-            else:
-                logger.error(f"xMatters API error: {response.status_code} - {response.text}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error sending to xMatters: {e}")
-            return False
-
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="Meeting Recording and Analysis Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-
+    
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--file",
         type=str,
-        help="Path to existing audio file to analyze"
+        help="Path to existing audio/video file to analyze"
     )
     group.add_argument(
         "--record",
         type=int,
         help="Record new audio for specified number of seconds"
     )
-
+    
     parser.add_argument(
         "--output",
         type=str,
         default="analysis_output.txt",
         help="Path to save analysis results (default: analysis_output.txt)"
     )
-
+    
     parser.add_argument(
-        "--no-xmatters",
-        action="store_true",
-        help="Skip sending results to xMatters"
+        "--ai",
+        type=str,
+        choices=["auto", "openai", "claude"],
+        default="auto",
+        help="Choose AI service (default: auto with fallback)"
     )
-
+    
     return parser.parse_args()
 
 def save_analysis(analysis: str, output_path: str) -> None:
@@ -307,7 +325,7 @@ def save_analysis(analysis: str, output_path: str) -> None:
 def main():
     """Main execution function"""
     args = parse_args()
-
+    
     try:
         # Initialize services
         transcriber = TranscriptionService()
@@ -315,43 +333,31 @@ def main():
             os.getenv("OPENAI_API_KEY", ""),
             os.getenv("ANTHROPIC_API_KEY", "")
         )
-
-        if not args.no_xmatters:
-            notifier = XMattersNotifier(
-                os.getenv("XMATTERS_URL", ""),
-                os.getenv("XMATTERS_API_KEY", "")
-            )
-
+        
         # Get audio file path
         if args.file:
             audio_path = Path(args.file)
             if not audio_path.exists():
                 raise FileNotFoundError(f"Audio file not found: {audio_path}")
-            logger.info(f"Using existing audio file: {audio_path}")
+            logger.info(f"Using existing file: {audio_path}")
         else:
             # Record new audio
             config = AudioConfig(seconds=args.record)
             recorder = AudioRecorder(config)
             audio_path = recorder.record()
             logger.info(f"Recorded new audio file: {audio_path}")
-
+        
         # Process audio
         if transcript := transcriber.transcribe(audio_path):
             logger.info("Transcription successful")
-            if analysis := analyzer.analyze(transcript):
+            if analysis := analyzer.analyze(transcript, args.ai):
                 logger.info("Analysis successful")
-
-                # Save analysis to file
                 save_analysis(analysis, args.output)
-
-                # Send to xMatters if enabled
-                if not args.no_xmatters:
-                    notifier.send_notification(analysis)
             else:
                 logger.error("Analysis failed")
         else:
             logger.error("Transcription failed")
-
+            
     except Exception as e:
         logger.error(f"Application error: {e}")
         raise
