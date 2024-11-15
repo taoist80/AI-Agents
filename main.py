@@ -19,7 +19,7 @@ import wave
 from anthropic import Anthropic
 import openai
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from moviepy.editor import VideoFileClip, AudioFileClip
 import tempfile
 import base64
@@ -29,7 +29,9 @@ import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import json
 from tqdm.asyncio import tqdm_asyncio
+import subprocess
 
 
 async def identify_attendees(transcript: str) -> List[str]:
@@ -58,6 +60,44 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+class VideoMetadata:
+    """Handles video metadata extraction"""
+
+    @staticmethod
+    def get_video_creation_time(video_path: Path) -> datetime:
+        """
+        Extract video creation time using ffprobe.
+
+        Args:
+            video_path: Path to the video file
+
+        Returns:
+            datetime: Video creation time or current time if not found
+        """
+        try:
+            cmd = [
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                str(video_path)
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            metadata = json.loads(result.stdout)
+            creation_time = metadata['format']['tags'].get('creation_time', None)
+            if creation_time:
+                creation_time = datetime.fromisoformat(creation_time.replace("Z", "+00:00"))
+                logger.info(f"Video creation time: {creation_time}")
+                return creation_time
+            else:
+                logger.warning("Creation time not found in metadata. Defaulting to current time.")
+                return datetime.now()
+        except Exception as e:
+            logger.error(f"Error retrieving video creation time: {e}")
+            return datetime.now()
+
 
 class AudioConverter:
     """Handles conversion of various audio/video formats to WAV"""
@@ -202,9 +242,9 @@ class TranscriptionService:
         self.max_file_size = 25 * 1024 * 1024  # 25MB in bytes
         self.max_concurrent = max_concurrent
 
-    async def transcribe(self, audio_file: Path) -> Optional[str]:
-        """Async transcription with chunk processing"""
-        logger.info(f"Processing {audio_file}")
+    async def transcribe(self, audio_file: Path) -> Optional[Dict]:
+        """Async transcription with chunk processing and improved logging"""
+        logger.info(f"Processing audio file: {audio_file}")
         try:
             # Convert to WAV if needed
             wav_file = self.converter.convert_to_wav(audio_file)
@@ -214,28 +254,22 @@ class TranscriptionService:
             logger.info(f"WAV file size: {file_size / (1024 * 1024):.2f} MB")
 
             try:
-                # Try Whisper first
-                try:
-                    if file_size > self.max_file_size:
-                        logger.info("File too large, splitting into chunks")
-                        transcript = await self._transcribe_large_file(wav_file)
-                    else:
-                        transcript = await self._transcribe_single_file(wav_file)
+                # Determine processing strategy
+                if file_size > self.max_file_size:
+                    logger.info("File too large, splitting into chunks")
+                    result = await self._transcribe_large_file(wav_file)
+                else:
+                    result = await self._transcribe_single_file(wav_file)
 
-                    if transcript:
-                        return transcript
-                except Exception as e:
-                    logger.warning(f"Whisper transcription failed: {e}")
-
-                    # Try Claude fallback if available
-                    if self.anthropic_client and file_size <= self.max_file_size:
-                        logger.info("Attempting transcription with Claude")
-                        return await self._transcribe_with_claude(wav_file)
-
-                return None
+                if result:
+                    logger.info(f"Transcription successful for file: {audio_file}")
+                    return result
+                else:
+                    logger.error("Transcription failed: No valid result returned")
+                    return None
 
             finally:
-                # Clean up temporary file if it was created
+                # Clean up temporary WAV file if it was created
                 if wav_file != audio_file and wav_file.parent == Path(tempfile.gettempdir()):
                     wav_file.unlink()
 
@@ -259,23 +293,31 @@ class TranscriptionService:
                 )
                 return transcript.text if transcript else None
 
-    async def _transcribe_large_file(self, wav_file: Path) -> Optional[str]:
-        """Handle transcription of large files with async chunk processing"""
+    async def _transcribe_large_file(self, wav_file: Path) -> Optional[Dict]:
+        """Handle transcription of large files with async chunk processing and timestamp alignment"""
         try:
             # Load audio file
             audio = AudioSegment.from_wav(str(wav_file))
+            audio_duration_ms = len(audio)
 
             # Calculate chunk parameters
             total_size = os.path.getsize(wav_file)
             chunk_size_ratio = self.max_file_size / total_size * 0.8
-            chunk_duration = len(audio) * chunk_size_ratio
+            chunk_duration_ms = int(audio_duration_ms * chunk_size_ratio)
 
             # Create chunks
             chunks = []
-            for start in range(0, len(audio), int(chunk_duration)):
-                end = min(start + int(chunk_duration), len(audio))
+            timestamps = []
+            for i, start in enumerate(range(0, audio_duration_ms, chunk_duration_ms)):
+                end = min(start + chunk_duration_ms, audio_duration_ms)
                 chunk = audio[start:end]
                 chunks.append(chunk)
+
+                # Calculate timestamps for the chunk
+                timestamps.append({
+                    "start": timedelta(milliseconds=start),
+                    "end": timedelta(milliseconds=end),
+                })
 
             logger.info(f"Split audio into {len(chunks)} chunks")
 
@@ -289,22 +331,33 @@ class TranscriptionService:
             try:
                 # Process chunks concurrently with rate limiting
                 semaphore = asyncio.Semaphore(self.max_concurrent)
-                async with aiohttp.ClientSession() as session:
-                    tasks = []
-                    for chunk_file in chunk_files:
-                        task = asyncio.create_task(
-                            self._process_chunk(chunk_file, semaphore)
-                        )
-                        tasks.append(task)
+                tasks = [
+                    self._process_chunk(chunk_file, semaphore)
+                    for chunk_file in chunk_files
+                ]
+                transcripts = await tqdm_asyncio.gather(*tasks, desc="Processing chunks")
 
-                    # Wait for all chunks to be processed
-                    transcripts = await tqdm_asyncio.gather(*tasks, desc="Processing chunks")
-
-                # Filter out None values and join transcripts
+                # Combine transcripts and generate segments
                 valid_transcripts = [t for t in transcripts if t]
-                if valid_transcripts:
-                    return " ".join(valid_transcripts)
-                return None
+                if not valid_transcripts:
+                    logger.error("All chunk transcriptions failed")
+                    return None
+
+                combined_transcript = " ".join(valid_transcripts)
+                segments = [
+                    {
+                        "start": str(timestamps[i]["start"]),
+                        "end": str(timestamps[i]["end"]),
+                        "text": valid_transcripts[i],
+                    }
+                    for i in range(len(valid_transcripts))
+                ]
+
+                logger.info("Successfully processed all chunks")
+                return {
+                    "transcript": combined_transcript,
+                    "segments": segments,
+                }
 
             finally:
                 # Clean up chunk files
@@ -406,7 +459,7 @@ class IncidentAnalyzer:
         """Analyze transcript using OpenAI's GPT-4"""
         prompt = self._get_analysis_prompt(transcript)
         response = self.openai_client.chat.completions.create(
-            model="gpt-4-turbo-preview",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1000
         )
@@ -421,18 +474,58 @@ class IncidentAnalyzer:
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content
-    
+
     @staticmethod
     def _get_analysis_prompt(transcript: str) -> str:
-        """Generate analysis prompt template"""
-        return f"""Based on the following incident transcript, please provide:
-1. Timeline of major events
-2. List of services impacted
-3. Initial root cause analysis
-4. Mitigation steps
+        """Generate analysis prompt template for incident analysis"""
+        return f"""Based on the following incident transcript, please provide a detailed incident report in the exact format below.
+        Maintain all timestamp formats as 'HH:MM AM/PM'. Begin all timestamps with the date (MM/DD) if it changes from the initial date.
 
-Transcript:
-{transcript}"""
+        Please adhere to the following rules:
+        - Timestamps must be included for each event and formatted as specified.
+        - If a timestamp is ambiguous (e.g., "2125"), convert it into the correct format.
+        - If no timestamp is available in the transcript, use 'Unknown'.
+        - Events must be listed in chronological order.
+        - Each event must be on a new line.
+
+        Example Timeline Format:
+        - 11:45 PM: Initial alert received.
+        - 10/28 12:00 AM: Secondary action taken.
+        - Unknown: Action performed by restoration team.
+
+        Timeline:
+        [Extract and format events in chronological order as specified above.]
+
+        Description:  
+        Brief Description: [Concise summary of the incident]  
+        [Include what happened, when it started, and basic impact]
+
+        Services Impacted:  
+        - [List each impacted service]  
+        - [Include scope of impact if known]
+
+        Root Cause:  
+        [Detailed explanation of what caused the incident]  
+        [Include any relevant technical details]
+
+        Mitigation Steps:  
+        Immediate Actions:  
+        - [List actions taken during incident]  
+        - [Include who took action if known]
+
+        Long-Term Solutions:  
+        - [List preventive measures]  
+        - [Include system improvements]  
+        - [Add monitoring/alerting changes]
+
+        Follow-up Actions:  
+        - [List specific tasks to be completed]  
+        - [Include ownership if known]  
+        - [Add timeline for completion if applicable]
+
+        Transcript:
+        {transcript}"""
+
 
 def parse_args():
     """Parse command line arguments"""
@@ -440,7 +533,7 @@ def parse_args():
         description="Meeting Recording and Analysis Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--file",
@@ -452,14 +545,14 @@ def parse_args():
         type=int,
         help="Record new audio for specified number of seconds"
     )
-    
+
     parser.add_argument(
         "--output",
         type=str,
         default="analysis_output.txt",
         help="Path to save analysis results (default: analysis_output.txt)"
     )
-    
+
     parser.add_argument(
         "--ai",
         type=str,
@@ -467,7 +560,15 @@ def parse_args():
         default="auto",
         help="Choose AI service (default: auto with fallback)"
     )
-    
+
+    parser.add_argument(
+        "--start-time",
+        type=str,
+        required=False,
+        default=None,
+        help="Video start time (format: YYYY-MM-DD HH:MM:SS)"
+    )
+
     return parser.parse_args()
 
 def save_analysis(analysis: str, output_path: str) -> None:
@@ -486,7 +587,15 @@ async def async_main():
     args = parse_args()
 
     try:
-        # Initialize clients
+        # Determine video creation time
+        if args.start_time:
+            video_start_time = datetime.strptime(args.start_time, "%Y-%m-%d %H:%M:%S")
+        else:
+            video_start_time = VideoMetadata.get_video_creation_time(Path(args.file))
+
+        logger.info(f"Using video start time: {video_start_time}")
+
+        # Initialize AI clients
         openai_client = openai.Client(api_key=os.getenv("OPENAI_API_KEY", ""))
         anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
 
@@ -497,37 +606,54 @@ async def async_main():
             os.getenv("ANTHROPIC_API_KEY", "")
         )
 
-        # Get audio file path
+        # Determine input type (file or recorded audio)
         if args.file:
             audio_path = Path(args.file)
             if not audio_path.exists():
                 raise FileNotFoundError(f"Audio file not found: {audio_path}")
             logger.info(f"Using existing file: {audio_path}")
         else:
-            # Record new audio
             config = AudioConfig(seconds=args.record)
             recorder = AudioRecorder(config)
             audio_path = recorder.record()
             logger.info(f"Recorded new audio file: {audio_path}")
 
-        # Process audio
-        if transcript := await transcriber.transcribe(audio_path):
-            logger.info("Transcription successful")
-            print("\nTranscript:")
-            print(transcript)
+        # Transcribe audio with timestamps
+        logger.info("Starting transcription...")
+        result = await transcriber.transcribe(audio_path)
 
-            if analysis := analyzer.analyze(transcript, args.ai):
+        if result and "segments" in result:
+            segments = result["segments"]
+            transcript = result["transcript"]
+
+            logger.info(f"Transcription successful with {len(segments)} segments")
+
+            # Save transcript with timestamps
+            save_analysis(json.dumps(segments, indent=2), "transcript_with_timestamps.json")
+            logger.info("Saved timestamped transcript")
+
+            # Print transcript with timestamps
+            logger.info("Transcript with timestamps:")
+            for segment in segments:
+                logger.info(f"{segment['start']} - {segment['end']}: {segment['text']}")
+
+            # Analyze transcript and save results
+            logger.info("Starting analysis...")
+            analysis = analyzer.analyze(transcript, args.ai)
+            if analysis:
                 logger.info("Analysis successful")
                 save_analysis(analysis, args.output)
-                print("\nAnalysis saved to:", args.output)
+                logger.info(f"Analysis saved to: {args.output}")
             else:
                 logger.error("Analysis failed")
         else:
-            logger.error("Transcription failed")
+            logger.error("Transcription failed or returned incomplete data")
 
     except Exception as e:
         logger.error(f"Application error: {e}")
         raise
+
+
 
 
 def main():
