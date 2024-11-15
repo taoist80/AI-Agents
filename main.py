@@ -1,13 +1,11 @@
 """
 Meeting Recording and Analysis Tool
 ---------------------------------
-CLI tool for analyzing meeting recordings (WAV, MP4, etc.) using OpenAI and Anthropic (Claude).
+CLI tool for analyzing meeting recordings (WAV, MP4, etc.) using OpenAI's Whisper and GPT/Claude.
 
 Usage:
-    python meeting_recorder.py --file path/to/video.mp4  # Analyze existing file
-    python meeting_recorder.py --record 60  # Record for 60 seconds
-    python meeting_recorder.py --file path/to/audio.wav --ai claude  # Force Claude
-    python meeting_recorder.py --file path/to/audio.wav --ai openai  # Force OpenAI
+    python main.py --file path/to/video.mp4 --ai openai
+    python main.py --record 60 --ai claude
 """
 
 import logging
@@ -18,7 +16,6 @@ from typing import Optional, List, Dict, Literal
 from pathlib import Path
 import pyaudio
 import wave
-import speech_recognition as sr
 from anthropic import Anthropic
 import openai
 import requests
@@ -148,7 +145,7 @@ class AudioRecorder:
         except OSError as e:
             logger.error(f"Error recording audio: {e}")
             raise
-
+    
     def _save_audio(self, path: Path, audio: pyaudio.PyAudio, frames: List[bytes]) -> None:
         """Save recorded audio frames to a WAV file"""
         try:
@@ -162,15 +159,16 @@ class AudioRecorder:
             raise
 
 class TranscriptionService:
-    """Handles audio transcription using Google Speech Recognition"""
+    """Handles audio transcription using OpenAI's Whisper model"""
     
-    def __init__(self):
-        self.recognizer = sr.Recognizer()
+    def __init__(self, openai_client):
+        """Initialize the transcription service with OpenAI client"""
+        self.client = openai_client
         self.converter = AudioConverter()
     
     def transcribe(self, audio_file: Path) -> Optional[str]:
         """
-        Transcribe audio file using Google Speech Recognition
+        Transcribe audio file using OpenAI's Whisper model
         
         Args:
             audio_file: Path to the audio/video file
@@ -183,25 +181,26 @@ class TranscriptionService:
             # Convert to WAV if needed
             wav_file = self.converter.convert_to_wav(audio_file)
             
-            # Transcribe
-            with sr.AudioFile(str(wav_file)) as source:
-                audio_data = self.recognizer.record(source)
-            
-            text = self.recognizer.recognize_google(audio_data)
-            logger.info("Transcription completed successfully")
+            # Transcribe using OpenAI Whisper
+            logger.info("Starting transcription with Whisper")
+            with open(wav_file, "rb") as audio:
+                transcript = self.client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio,
+                    language="en"
+                )
             
             # Clean up temporary file if it was created
             if wav_file != audio_file and wav_file.parent == Path(tempfile.gettempdir()):
                 wav_file.unlink()
-                
-            return text
             
-        except sr.UnknownValueError:
-            logger.error("Google Speech Recognition could not understand audio")
-            return None
-        except sr.RequestError as e:
-            logger.error(f"Google Speech Recognition service error: {e}")
-            return None
+            if transcript.text:
+                logger.info("Transcription completed successfully")
+                return transcript.text
+            else:
+                logger.error("No transcription results returned")
+                return None
+                
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return None
@@ -327,8 +326,11 @@ def main():
     args = parse_args()
     
     try:
+        # Initialize OpenAI client
+        openai_client = openai.Client(api_key=os.getenv("OPENAI_API_KEY", ""))
+        
         # Initialize services
-        transcriber = TranscriptionService()
+        transcriber = TranscriptionService(openai_client)
         analyzer = IncidentAnalyzer(
             os.getenv("OPENAI_API_KEY", ""),
             os.getenv("ANTHROPIC_API_KEY", "")
@@ -350,9 +352,13 @@ def main():
         # Process audio
         if transcript := transcriber.transcribe(audio_path):
             logger.info("Transcription successful")
+            print("\nTranscript:")
+            print(transcript)  # Print transcript for review
+            
             if analysis := analyzer.analyze(transcript, args.ai):
                 logger.info("Analysis successful")
                 save_analysis(analysis, args.output)
+                print("\nAnalysis saved to:", args.output)
             else:
                 logger.error("Analysis failed")
         else:
