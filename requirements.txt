@@ -7,8 +7,15 @@ moviepy
 wave
 pydub
 ffmpeg-python
+soundcard  # For system audio recording
+sounddevice  # For audio device handling
+numpy  # Required for audio processing
 
-# Optional: Audio Recording
+# Browser Automation
+selenium
+webdriver_manager  # For ChromeDriver management
+
+# Audio Recording
 PyAudio
 
 # HTTP Requests
@@ -24,8 +31,6 @@ tqdm
 # File Operations and Data Handling
 pathlib
 
-# Async Support
-asyncio
-
-#Time Stamps:
-datetime
+# Additional Dependencies
+python-dateutil  # For date parsing
+typing-extensions  # For Python 3.7+ typing support
